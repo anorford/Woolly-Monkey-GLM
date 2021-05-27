@@ -1,0 +1,328 @@
+---
+title: "Bayesian GLM SDM Code"
+output: html_document
+---
+
+Author: Ariek Barakat Norford
+
+This code is written so that the reader can insert their own data and run it.  To see my project code specifically, refer to the Woolly Monkey Bayesian GLM SDM Code.Rmd document.
+
+#Load libraries
+
+```{r}
+library(abind)
+library(adehabitatHR)
+library(boot)
+library(coda)
+library(ggplot2)
+library(R2jags)
+library(raster)
+library(pROC)
+library(sp)
+```
+
+#Thin occurrence data
+
+```{r}
+Presence <- read.csv("#Path to your data in CSV format; CSV must have three columns, longitude, latitude, and name")
+Presence <- as.data.frame(Presence)
+```
+
+```{r}
+#This thins the presences by 5 km to reduce spatial bias
+ThinnedPresences <- spThin::thin(loc.data=Presence, lat.col="latitude", long.col="longitude", spec.col="name", thin.par = 5, reps = 100, locs.thinned.list.return = TRUE, write.files = FALSE, verbose = FALSE)
+```
+
+```{r}
+#The code in this chunk is derived from code for [Wallace](https://wallaceecomod.github.io/vignettes/wallace_vignette.html) by Jamie M. Kass, Sarah I. Meenan, Gonzalo E. Pinilla-Buitrago, Cory Merow, and Robert P. Anderson
+# Find the iteration that returns the max number of occurrences
+MaxThin <- which(sapply(ThinnedPresences, nrow) == max(sapply(ThinnedPresences, nrow)))
+#If there's more than one max, pick the first one
+MaxThin <- ThinnedPresences[[ifelse(length(MaxThin) > 1, MaxThin[1], MaxThin)]]  
+#Save only the thinned occurrences in your original dataset
+ThinnedPresences <- Presence[as.numeric(rownames(MaxThin)),]  
+```
+
+```{r}
+#If you are going to split your data outside of R
+write.csv(ThinnedPresences,"ThinnedPresences.csv")
+```
+
+Note, I split the data based on source in order to allow for independent training and testing data.  This was completed outside of R.
+
+```{r}
+Absence <- read.csv("#Path to your data in CSV format; CSV must have three columns, longitude, latitude, and name")
+Absence <- as.data.frame(Absence)
+```
+
+```{r}
+#This thins the absences by 5 km to reduce spatial bias
+ThinnedAbsences <- spThin::thin(loc.data=Absences, lat.col="latitude", long.col="longitude", spec.col="name", thin.par = 5, reps = 100, locs.thinned.list.return = TRUE, write.files = FALSE, verbose = FALSE)
+```
+
+```{r}
+#The code in this chunk is derived from code for [Wallace](https://wallaceecomod.github.io/vignettes/wallace_vignette.html) by Jamie M. Kass, Sarah I. Meenan, Gonzalo E. Pinilla-Buitrago, Cory Merow, and Robert P. Anderson
+# Find the iteration that returns the max number of occurrences
+MaxThin <- which(sapply(ThinnedAbsences, nrow) == max(sapply(ThinnedAbsences, nrow)))
+#If there's more than one max, pick the first one
+MaxThin <- ThinnedAbsences[[ifelse(length(MaxThin) > 1, MaxThin[1], MaxThin)]]  
+#Save only the thinned occurrences in your original dataset
+ThinnedAbsences <- Absence[as.numeric(rownames(MaxThin)),]  
+```
+
+```{r}
+#If you are going to split your data outside of R
+write.csv(ThinnedAbsences,"ThinnedAbsences.csv")
+```
+
+#Load presence/absence data
+
+```{r}
+#Data used to train the model
+TrainingDF <- read.csv(#CSV file with longitude, latitude, presence; presence has 1 (present) or 0 (absent))
+TrainingDF <- as.data.frame(TrainingDF)
+```
+
+```{r}
+#Data used to test the model
+TestingDF <- read.csv(#CSV file with longitude, latitude, presence; presence has 1 (present) or 0 (absent))
+TestingDF <- as.data.frame(TestingDF)
+```
+
+#Create study area
+
+I use a minimum convex polygon around the presence data with a buffer of 1 degree around the outer points.
+
+```{r}
+#Load in data for cropping the global layers to my study region
+PolygonData <- ThinnedPresences
+PolygonData <- as.data.frame(PolygonData)
+#The dataframe should only contain columns for longitude and latitude
+PolygonData <- PolygonData[,c(2:3)]
+#Specify that these are coordinates
+coordinates(PolygonData) <- c("longitude","latitude")
+#Set CRS
+proj4string(PolygonData) <- CRS("+proj=utm +zone=18 +datum=WGS84 +units=m +no_defs")
+#Draw polygon to include all points (percent=100 will sometimes throw an error)
+ExtentOccurrences <- mcp(PolygonData,percent=99.9)
+#Buffer size of the study extent polygon defined as 1.0 degrees.
+ExtentOccurrences <- rgeos::gBuffer(ExtentOccurrences, width = 1.0)
+```
+
+#Add environmental layers
+
+```{r}
+#Read in the layers
+EnvironmentalLayer1Globe <- raster("#Path to your data in tif format") 
+EnvironmentalLayer2Globe <- raster("#Path to your data in tif format") 
+EnvironmentalLayer3Globe <- raster("#Path to your data in tif format")
+#There can be more than 3
+#Crop data
+#Crop the files using ExtentOccurrences
+EnvironmentalLayer1Crop <- raster::crop(EnvironmentalLayer1Globe,ExtentOccurrences)
+EnvironmentalLayer2Crop <- raster::crop(EnvironmentalLayer2Globe,ExtentOccurrences)
+EnvironmentalLayer3Crop <- raster::crop(EnvironmentalLayer3Globe,ExtentOccurrences)
+#Mask the background extent shape from the cropped raster
+EnvironmentalLayer1 <- raster::mask(EnvironmentalLayer1Crop,ExtentOccurrences)
+EnvironmentalLayer2 <- raster::mask(EnvironmentalLayer2Crop,ExtentOccurrences)
+EnvironmentalLayer3 <- raster::mask(EnvironmentalLayer3Crop,ExtentOccurrences)
+```
+
+```{r}
+#Standardization of layers; this is necessary for model convergence
+#Store values of the raster
+EnvironmentalLayer1Data <- rasterToPoints(EnvironmentalLayer1)
+EnvironmentalLayer1Data <- EnvironmentalLayer1Data[,3]
+EnvironmentalLayer2Data <- rasterToPoints(EnvironmentalLayer2)
+EnvironmentalLayer2Data <- EnvironmentalLayer2Data[,3]
+EnvironmentalLayer3Data <- rasterToPoints(EnvironmentalLayer3)
+EnvironmentalLayer3Data <- EnvironmentalLayer3Data[,3]
+#Store means
+EnvironmentalLayer1Mean <- cellStats(EnvironmentalLayer1,stat='mean')
+EnvironmentalLayer2Mean <- cellStats(EnvironmentalLayer2,stat='mean')
+EnvironmentalLayer3Mean <- cellStats(EnvironmentalLayer3,stat='mean')
+#Store standard deviations
+EnvironmentalLayer1sd <- cellStats(EnvironmentalLayer1,stat='sd')
+EnvironmentalLayer2sd <- cellStats(EnvironmentalLayer2,stat='sd')
+EnvironmentalLayer3sd <- cellStats(EnvironmentalLayer3,stat='sd')
+#Standardize values in the raster file
+EnvironmentalLayer1Standardized <- calc(EnvironmentalLayer1,fun=function(EnvironmentalLayer1Data){(EnvironmentalLayer1Data-EnvironmentalLayer1Mean)/EnvironmentalLayer1sd})
+EnvironmentalLayer2Standardized <- calc(EnvironmentalLayer2,fun=function(EnvironmentalLayer2Data){(EnvironmentalLayer2Data-EnvironmentalLayer2Mean)/EnvironmentalLayer2sd})
+EnvironmentalLayer3Standardized <- calc(EnvironmentalLayer3,fun=function(EnvironmentalLayer3Data){(EnvironmentalLayer3Data-EnvironmentalLayer3Mean)/EnvironmentalLayer3sd})
+```
+
+#Extract values at training sites
+
+```{r}
+#Store values at training presence and absence points
+EnvironmentalLayer1 <- c(length=#Number of presence/absence points)
+for(i in 1:#Number of presence/absence points){
+  EnvironmentalLayer1[i] <- raster::extract(EnvironmentalLayer1Standardized,TrainingDF[i,1:2],buffer=#Radius in meters of the extent with which you want to associate your occurrence point,fun=mean #Could also do max to get the maximum value in the buffer region rather than averaging,sp=TRUE)
+  TrainingDF[i,4] <- EnvironmentalLayer1[i]
+  TrainingDF <- as.data.frame(TrainingDF)
+}
+EnvironmentalLayer2 <- c(length=#Number of presence/absence points)
+for(i in 1:#Number of presence/absence points){
+  EnvironmentalLayer2[i] <- raster::extract(EnvironmentalLayer2Standardized,TrainingDF[i,1:2],buffer=#Radius in meters of the extent with which you want to associate your occurrence point,fun=mean #Could also do max to get the maximum value in the buffer region rather than averaging,sp=TRUE)
+  TrainingDF[i,4] <- EnvironmentalLayer2[i]
+  TrainingDF <- as.data.frame(TrainingDF)
+}
+EnvironmentalLayer3 <- c(length=#Number of presence/absence points)
+for(i in 1:#Number of presence/absence points){
+  EnvironmentalLayer3[i] <- raster::extract(EnvironmentalLayer3Standardized,TrainingDF[i,1:2],buffer=#Radius in meters of the extent with which you want to associate your occurrence point,fun=mean #Could also do max to get the maximum value in the buffer region rather than averaging,sp=TRUE)
+  TrainingDF[i,4] <- EnvironmentalLayer3[i]
+  TrainingDF <- as.data.frame(TrainingDF)
+}
+```
+
+```{r}
+#The model will take the data out of its dataframe form and you will need to re-run the code above if you want to re-run the model.  Therefore, it is a good idea to have the dataframe you will run through the model be a duplicate of the one you created above.
+TrainingSetModel <- as.data.frame(TrainingDF)
+```
+
+#Train model
+
+```{r}
+#Write the model to a text file
+sink("Name.jags")
+cat("
+  model{
+  for(i in 1:#Number of presence/absence points){
+  logit(p[i]) <- a+b*EnvironmentalLayer1[i]+c*EnvironmentalLayer2[i]+d*EnvironmentalLayer3[i] #Probability of occurrence follows this linear model
+  y[i]~dbin(p[i],1) #Whether the data is a presence or absence is determined by a binomial draw with probability p
+  }
+  #Priors
+  a~dnorm(0,0.5) #This is uninformative in log scale
+  b~dnorm(0,0.5) 
+  c~dnorm(0,0.5)
+  }",fill=TRUE)
+sink()
+#Make a list including all the data the model will need to run
+TrainingSetModel <- list(EnvironmentalLayer1=TrainingSetModel$V4,EnvironmentalLayer2=TrainingSetModel$V5,EnvironmentalLayer3=TrainingSetModel$V6,y=TrainingSetModel$presence)
+#Make a function where you put the list of parameters and their initial values for each of the four chains
+Initial <- list(list(a=1,b=0.2,c=0.3),list(a=2,b=-0.2,c=-0.3),list(a=3,b=0.7,c=0.8),list(a=4,b=-0.7,c=-0.8))
+#Make a column vector with the names of the parameters you want to track
+Parameters <- c("a","b","c")
+#Set the variables for the MCMC
+ni <- 100000  #Number of draws from the posterior
+nt <- 20    #Thinning rate 
+nb <- 50000  #Number to discard for burn-in 
+nc <- 4  #Number of chains
+#Run the JAGS function to run the code
+Results = jags(inits=Initial,
+         n.chains=nc,
+         model.file="Name.jags",
+         working.directory=getwd(),
+         data=TrainingSetModel,
+         parameters.to.save=Parameters,
+         n.thin=nt,
+         n.iter=ni,
+         n.burnin=nb,
+         DIC=T)
+#Print the results
+Results
+```
+
+#Check for model convergence
+
+```{r}
+#Plot the four MCMC chains
+MCMCConvergence <- as.mcmc(Results)
+plot(MCMCConvergence[,1]) #For a
+plot(MCMCConvergence[,2]) #For b
+plot(MCMCConvergence[,3]) #For c
+plot(MCMCConvergence[,4]) #For d
+```
+
+#Test model
+
+```{r}
+#Store values at testing presence and absence points
+EnvironmentalLayer1 <- c(length=#Number of presence/absence points)
+for(i in 1:#Number of presence/absence points){
+  EnvironmentalLayer1[i] <- raster::extract(EnvironmentalLayer1Standardized,TestingDF[i,1:2],buffer=#Radius in meters of the extent with which you want to associate your occurrence point,fun=mean #Could also do max to get the maximum value in the buffer region rather than averaging,sp=TRUE)
+  TestingDF[i,4] <- EnvironmentalLayer1[i]
+  TestingDF <- as.data.frame(TestingDF)
+}
+EnvironmentalLayer2 <- c(length=#Number of presence/absence points)
+for(i in 1:#Number of presence/absence points){
+  EnvironmentalLayer2[i] <- raster::extract(EnvironmentalLayer2Standardized,TestingDF[i,1:2],buffer=#Radius in meters of the extent with which you want to associate your occurrence point,fun=mean #Could also do max to get the maximum value in the buffer region rather than averaging,sp=TRUE)
+  TestingDF[i,4] <- EnvironmentalLayer2[i]
+  TestingDF <- as.data.frame(TestingDF)
+}
+EnvironmentalLayer3 <- c(length=#Number of presence/absence points)
+for(i in 1:#Number of presence/absence points){
+  EnvironmentalLayer3[i] <- raster::extract(EnvironmentalLayer3Standardized,TestingDF[i,1:2],buffer=#Radius in meters of the extent with which you want to associate your occurrence point,fun=mean #Could also do max to get the maximum value in the buffer region rather than averaging,sp=TRUE)
+  TestingDF[i,4] <- EnvironmentalLayer3[i]
+  TestingDF <- as.data.frame(TestingDF)
+}
+```
+
+```{r}
+#Probability of occurrence at training sites
+POcc <- c(length=#Number of presence/absence points)
+for(i in 1:#Number of presence/absence points){
+  POcc[i] <- inv.logit(a+b*TrainingDF[i,4]+c*TrainingDF[i,5]+d*TrainingDF[i,6]) #Replace a, b, c, d with mean values on which your model converged
+  TrainingDF[i,7] <- POcc[i]
+}
+```
+
+```{r}
+#Probability of occurrence at testing sites
+POcc <- c(length=#Number of presence/absence points)
+for(i in 1:#Number of presence/absence points){
+  POcc[i] <- inv.logit(a+b*TestingDF[i,4]+c*TestingDF[i,5]+d*TestingDF[i,6]) #Replace a, b, c, d with mean values on which your model converged
+  TestingDF[i,7] <- POcc[i]
+}
+```
+
+```{r}
+#Turn probability of occurrenc into presence/absence
+Prediction <- c(length=#Number of presence/absence points in training set)
+for(i in 1:#Number of presence/absence points in training set){
+  if(TestingDF[i,7]>#Threshold probability for presence){
+    Prediction[i] <- 1
+  }else{
+    Prediction[i] <- 0
+  }
+}
+TestingDF <- cbind(TestingDF,Prediction)
+TestingDF <- as.data.frame(TestingDF)
+```
+
+```{r}
+#Calculate AUC
+#Store the observed presence/absence of the testing data
+Category <- TestingDF[,3]
+#Store predicted presence/absence of the testing data
+Prediction <- TestingDF[,8]
+Roc <- roc(Category,Prediction) #Determine the receiver operating curve
+auc(Roc) #Find the area under the receiver operating curve
+```
+
+#Visualize model
+
+Note: All raster layers must have the same extent and resolution in order for this section of the code to work.
+
+```{r}
+#Store the rasters of the environmental layers as dataframes
+EnvironmentalLayer1StandardizedData <- rasterToPoints(EnvironmentalLayer1Standardized)
+EnvironmentalLayer1StandardizedData <- as.data.frame(EnvironmentalLayer1StandardizedData)
+EnvironmentalLayer2StandardizedData <- rasterToPoints(EnvironmentalLayer2Standardized)
+EnvironmentalLayer2StandardizedData <- as.data.frame(EnvironmentalLayer2StandardizedData)
+EnvironmentalLayer3StandardizedData <- rasterToPoints(EnvironmentalLayer3Standardized)
+EnvironmentalLayer3StandardizedData <- as.data.frame(EnvironmentalLayer3StandardizedData)
+```
+
+```{r}
+#In every grid cell, you plug the values of the different environmental into your model to determine the probability of occurrence at that spot. Replace a, b, c, d with mean values on which your model converged.
+Map <- overlay(EnvironmentalLayer1Standardized,EnvironmentalLayer2Standardized,EnvironmentalLayer3Standardized,fun=function(EnvironmentalLayer1StandardizedData,EnvironmentalLayer2StandardizedData,EnvironmentalLayer3StandardizedData){inv.logit(a+b*EnvironmentalLayer1StandardizedDat+c*EnvironmentalLayer2StandardizedData+d*EnvironmentalLayer3StandardizedData})
+#Save as dataframe for ggplot
+MapData <- rasterToPoints(Map)
+MapData <- as.data.frame(MapData)
+```
+
+```{r}
+#Plot the predicted probability of occurrence across the study region and the presence data
+ggplot(data=MapData,aes(x=x,y=y))+geom_raster(aes(fill=layer))+coord_quickmap()+geom_point(data=ThinnedPresences,aes(x=longitude,y=latitude),color="#F0E442")+theme_classic()
+```

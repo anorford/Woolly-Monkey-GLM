@@ -1,0 +1,443 @@
+---
+title: "Woolly Monkey Bayesian GLM SDM Code"
+output: html_document
+---
+
+Author: Ariek Barakat Norford
+
+This is my project code.  For how to use the code see the document Bayesian GLM SDM Code.Rmd.
+
+#Load libraries 
+
+```{r}
+library(abind)
+library(adehabitatHR)
+library(boot)
+library(coda)
+library(ggplot2)
+library(R2jags)
+library(raster)
+library(pROC)
+library(sp)
+```
+
+#Thin occurrence data
+
+Data of presences are available through [GBIF](https://www.gbif.org/).  This study uses target group absences, which are when similar species are sited, but not the focal species of the study.  All of my "absences" are 5 km away from any of the presences.
+
+```{r}
+Presence <- read.csv("Presence.csv")
+Presence <- as.data.frame(Presence)
+```
+
+```{r}
+#Remove columns that are not longitude, latitude, name
+WoollyMonkeyPresences <- Presence[,-c(4:5)]
+WoollyMonkeyPresences <- as.data.frame(WoollyMonkeyPresences)
+#This thins the presences by 5 km to reduce spatial bias
+ThinnedWoollyMonkeyPresences <- spThin::thin(loc.data=WoollyMonkeyPresences, lat.col="latitude", long.col="longitude", spec.col="name", thin.par = 5, reps = 100, locs.thinned.list.return = TRUE, write.files = FALSE, verbose = FALSE)
+```
+
+```{r}
+#The code in this chunk is derived from code for [Wallace](https://wallaceecomod.github.io/vignettes/wallace_vignette.html) by Jamie M. Kass, Sarah I. Meenan, Gonzalo E. Pinilla-Buitrago, Cory Merow, and Robert P. Anderson
+# Find the iteration that returns the max number of occurrences
+MaxThin <- which(sapply(ThinnedWoollyMonkeyPresences, nrow) == max(sapply(ThinnedWoollyMonkeyPresences, nrow)))
+#If there's more than one max, pick the first one
+MaxThin <- ThinnedWoollyMonkeyPresences[[ifelse(length(MaxThin) > 1, MaxThin[1], MaxThin)]]  
+#Save only the thinned occurrences in your original dataset
+ThinnedWoollyMonkeyPresences <- Presence[as.numeric(rownames(MaxThin)),]  
+```
+
+```{r}
+#If you are going to split your data outside of R
+write.csv(ThinnedWoollyMonkeyPresences,"ThinnedPresences.csv")
+```
+
+```{r}
+Absence <- read.csv("Absence.csv")
+Absence <- as.data.frame(Absence)
+```
+
+```{r}
+#Remove columns that are not longitude, latitude, name
+WoollyMonkeyAbsences <- Absence[,-c(4:5)]
+WoollyMonkeyAbsences <- as.data.frame(WoollyMonkeyAbsences)
+#This thins the presences by 5 km to reduce spatial bias
+ThinnedWoollyMonkeyAbsences <- spThin::thin(loc.data=WoollyMonkeyAbsences, lat.col="latitude", long.col="longitude", spec.col="name", thin.par = 5, reps = 100, locs.thinned.list.return = TRUE, write.files = FALSE, verbose = FALSE)
+```
+
+```{r}
+#The code in this chunk is derived from code for [Wallace](https://wallaceecomod.github.io/vignettes/wallace_vignette.html) by Jamie M. Kass, Sarah I. Meenan, Gonzalo E. Pinilla-Buitrago, Cory Merow, and Robert P. Anderson
+# Find the iteration that returns the max number of occurrences
+MaxThin <- which(sapply(ThinnedWoollyMonkeyAbsences, nrow) == max(sapply(ThinnedWoollyMonkeyAbsences, nrow)))
+#If there's more than one max, pick the first one
+MaxThin <- ThinnedWoollyMonkeyAbsences[[ifelse(length(MaxThin) > 1, MaxThin[1], MaxThin)]]  
+#Save only the thinned occurrences in your original dataset
+ThinnedWoollyMonkeyAbsences <- WoollyMonkeyAbsences[as.numeric(rownames(MaxThin)),]  
+```
+
+```{r}
+#If you are going to split your data outside of R
+write.csv(ThinnedWoollyMonkeyAbsences,"ThinnedAbsences.csv")
+```
+
+Note, I split the data based on source in order to allow for independent training and testing data.  This was completed outside of R.
+
+#Load presence/absence data
+
+```{r}
+#Data used to train the model
+TrainingDF <- read.csv("Training.csv")
+TrainingDF <- as.data.frame(TrainingDF)
+```
+
+```{r}
+#Data used to test the model
+TestingDF <- read.csv("Testing.csv")
+TestingDF <- as.data.frame(TestingDF)
+```
+
+#Create study area
+
+I use a minimum convex polygon around the presence data with a buffer of 1 degree around the outer points.
+
+```{r}
+#Load in data for cropping the global layers to my study region
+PolygonData <- ThinnedWoollyMonkeyPresences
+PolygonData <- as.data.frame(PolygonData)
+#The dataframe should only contain columns for longitude and latitude
+PolygonData <- PolygonData[,c(2:3)]
+#Specify that these are coordinates
+coordinates(PolygonData) <- c("longitude","latitude")
+#Set CRS
+proj4string(PolygonData) <- CRS("+proj=utm +zone=18 +datum=WGS84 +units=m +no_defs")
+#Draw polygon to include all points (percent=100 will sometimes throw an error)
+ExtentOccurrences <- mcp(PolygonData,percent=99.9)
+#Buffer size of the study extent polygon defined as 1.0 degrees.
+ExtentOccurrences <- rgeos::gBuffer(ExtentOccurrences, width = 1.0)
+```
+
+#Add environmental layers
+
+I used the following layers in my research: bioclimatic layers from [Chelsa](https://chelsa-climate.org/bioclim/), forest density from Hansen et al., 2013 [global forest change](https://earthenginepartners.appspot.com/science-2013-global-forest/download_v1.7.html), human population size from Schiavina et al., 2019 [Global Human Settlement population layer](https://ghsl.jrc.ec.europa.eu/datasets.php), and road density from the Meijer et al., 2018 [Global Roads Inventory Project](https://www.globio.info/global-patterns-of-current-and-future-road-infrastructure).
+
+```{r}
+#Read in the layers
+Bio3Globe <- raster("CHELSA_bio10_03.tif") #Isothermality
+Bio5Globe <- raster("CHELSA_bio10_05.tif") #Max temperature of warmest month
+Bio16Globe <- raster("CHELSA_bio10_16.tif") #Precipitation of wettest quarter
+Bio17Globe <- raster("CHELSA_bio10_17.tif") #Precipitation of driest quarter
+DensityGlobe <- raster("/Users/arieknorford/Desktop/FinalForestLayer.tif") #Forest density
+PopGlobe <- raster("/Users/arieknorford/Desktop/PopFinal.tif") #Human population size
+RoadsGlobe <- raster("/Users/arieknorford/Desktop/FinalRoads.tif") #Road density
+#Crop data
+#Crop the files using ExtentOccurrences
+Bio3Crop <- raster::crop(Bio3Globe,ExtentOccurrences)
+Bio5Crop <- raster::crop(Bio5Globe,ExtentOccurrences)
+Bio16Crop <- raster::crop(Bio16Globe,ExtentOccurrences)
+Bio17Crop <- raster::crop(Bio17Globe,ExtentOccurrences)
+DensityCrop <- raster::crop(DensityGlobe,ExtentOccurrences)
+PopCrop <- raster::crop(PopGlobe,ExtentOccurrences)
+RoadsCrop <- raster::crop(RoadsGlobe,ExtentOccurrences)
+#Mask the background extent shape from the cropped raster
+Bio3 <- raster::mask(Bio3Crop,ExtentOccurrences)
+Bio5 <- raster::mask(Bio5Crop,ExtentOccurrences)
+Bio16 <- raster::mask(Bio16Crop,ExtentOccurrences)
+Bio17 <- raster::mask(Bio17Crop,ExtentOccurrences)
+Density <- raster::mask(DensityCrop,ExtentOccurrences)
+Pop <- raster::mask(PopCrop,ExtentOccurrences)
+Roads <- raster::mask(RoadsCrop,ExtentOccurrences)
+```
+
+```{r}
+#Standardization of layers; this is necessary for model convergence
+#Store values of the raster
+Bio3Data <- rasterToPoints(Bio3)
+Bio3Data <- Bio3Data[,3]
+Bio5Data <- rasterToPoints(Bio5)
+Bio5Data <- Bio5Data[,3]
+Bio16Data <- rasterToPoints(Bio16)
+Bio16Data <- Bio16Data[,3]
+Bio17Data <- rasterToPoints(Bio17)
+Bio17Data <- Bio17Data[,3]
+DensityData <- rasterToPoints(Density)
+DensityData <- DensityData[,3]
+PopData <- rasterToPoints(Pop)
+PopData <- PopData[,3]
+RoadsData <- rasterToPoints(Roads)
+RoadsData <- RoadsData[,3]
+#Store means
+Bio3Mean <- cellStats(Bio3,stat='mean')
+Bio5Mean <- cellStats(Bio5,stat='mean')
+Bio16Mean <- cellStats(Bio16,stat='mean')
+Bio17Mean <- cellStats(Bio17,stat='mean')
+DensityMean <- cellStats(Density,stat='mean')
+PopMean <- cellStats(Pop,stat='mean')
+RoadsMean <- cellStats(Roads,stat='mean')
+#Store standard deviations
+Bio3sd <- cellStats(Bio3,stat='sd')
+Bio5sd <- cellStats(Bio5,stat='sd')
+Bio16sd <- cellStats(Bio16,stat='sd')
+Bio17sd <- cellStats(Bio17,stat='sd')
+Densitysd <- cellStats(Density,stat='sd')
+Popsd <- cellStats(Pop,stat='sd')
+Roadssd <- cellStats(Roads,stat='sd')
+#Standardize values in the raster file
+Bio3Standardized <- calc(Bio3,fun=function(Bio3Data){(Bio3Data-Bio3Mean)/Bio3sd})
+Bio5Standardized <- calc(Bio5,fun=function(Bio5Data){(Bio5Data-Bio5Mean)/Bio5sd})
+Bio16Standardized <- calc(Bio16,fun=function(Bio16Data){(Bio16Data-Bio16Mean)/Bio16sd})
+Bio17Standardized <- calc(Bio17,fun=function(Bio17Data){(Bio17Data-Bio17Mean)/Bio17sd})
+DensityStandardized <- calc(Density,fun=function(DensityData){(DensityData-DensityMean)/Densitysd})
+PopStandardized <- calc(Pop,fun=function(PopData){(PopData-PopMean)/Popsd})
+RoadsStandardized <- calc(Roads,fun=function(RoadsData){(RoadsData-RoadsMean)/Roadssd})
+```
+
+#Extract values at training sites
+
+```{r}
+#Store values at training presence and absence points.  This is for my model of minimum home range size (buffer = 600 m).
+Bio3 <- c(length=195)
+for(i in 1:195){
+  Bio3[i] <- raster::extract(Bio3Standardized,TrainingDF[i,1:2],buffer=600,fun=mean,sp=TRUE)
+  TrainingDF[i,4] <- Bio3[i]
+  TrainingDF <- as.data.frame(TrainingDF)
+}
+Bio5 <- c(length=195)
+for(i in 1:195){
+  Bio5[i] <- raster::extract(Bio5Standardized,TrainingDF[i,1:2],buffer=600,fun=mean,sp=TRUE)
+  TrainingDF[i,5] <- Bio5[i]
+  TrainingDF <- as.data.frame(TrainingDF)
+}
+Bio16 <- c(length=195)
+for(i in 1:195){
+  Bio16[i] <- raster::extract(Bio16Standardized,TrainingDF[i,1:2],buffer=600,fun=mean,sp=TRUE)
+  TrainingDF[i,6] <- Bio16[i]
+  TrainingDF <- as.data.frame(TrainingDF)
+}
+Bio17 <- c(length=195)
+for(i in 1:195){
+  Bio17[i] <- raster::extract(Bio17Standardized,TrainingDF[i,1:2],buffer=600,fun=mean,sp=TRUE)
+  TrainingDF[i,7] <- Bio17[i]
+  TrainigDF <- as.data.frame(TrainingDF)
+}
+Density <- c(length=195)
+for(i in 1:195){
+  Density[i] <- raster::extract(DensityStandardized,TrainingDF[i,1:2],buffer=600,fun=mean,sp=TRUE)
+  TrainingDF[i,8] <- Density[i]
+  TrainingDF <- as.data.frame(TrainingDF)
+}
+Pop <- c(length=195)
+for(i in 1:195){
+  Pop[i] <- raster::extract(PopStandardized,TrainingDF[i,1:2],buffer=600,fun=mean,sp=TRUE)
+  TrainingDF[i,9] <- Pop[i]
+  TrainingDF <- as.data.frame(TrainingDF)
+}
+Roads <- c(length=195)
+for(i in 1:195){
+  Roads[i] <- raster::extract(RoadsStandardized,TrainingDF[i,1:2],buffer=600,fun=mean,sp=TRUE)
+  TrainingDF[i,10] <- Roads[i]
+  TrainingDF <- as.data.frame(TrainingDF)
+}
+```
+
+```{r}
+#The model will take the data out of its dataframe form and you will need to re-run the code above if you want to re-run the model.  Therefore, it is a good idea to have the dataframe you will run through the model be a duplicate of the one you created above.
+TrainingSetModel <- as.data.frame(TrainingDF)
+```
+
+#Train model
+
+```{r}
+#Write the model to a text file
+sink("MinHomeRange.jags")
+cat("
+  model{
+  for(i in 1:195){
+  logit(p[i]) <- a+b*Iso[i]+c*MaxTempWarm[i]+d*PrecipWet[i]+e*PrecipDry[i]+f*Density[i]+g*Pop[i]+h*Roads[i] #Probability of occurrence follows this linear model
+  y[i]~dbin(p[i],1) #Whether the data is a presence or absence is determined by a binomial draw with probability p
+  }
+  #Priors
+  a~dnorm(0,0.5) #This is uninformative in log scale
+  b~dnorm(0,0.5)
+  c~dnorm(0,0.5)
+  d~dnorm(0,0.5)
+  e~dnorm(0,0.5)
+  f~dnorm(0,0.5)
+  g~dnorm(0,0.5)
+  h~dnorm(0,0.5)
+  }",fill=TRUE)
+sink()
+#Make a list including all the data the model will need to run
+TrainingSetModel <- list(Iso=TrainingSetModel$V4,MaxTempWarm=TrainingSetModel$V5,PrecipWet=TrainingSetModel$V6,PrecipDry=TrainingSetModel$V7,y=TrainingSetModel$presence,Density=TrainingSetModel$V8,Pop=TrainingSetModel$V9,Roads=TrainingSetModel$V10)
+#Make a function where you put the list of parameters and their initial values for each of the four chains
+Initial <- list(list(a=1,b=0.2,c=0.3,d=0.4,e=0.5,f=-1,g=-2,h=-3),list(a=2,b=-0.2,c=-0.3,d=-0.4,e=-0.5,f=-2,g=-1,h=-1),list(a=3,b=0.7,c=0.8,d=0.9,e=0.1,f=-1.5,g=-4,h=0),list(a=4,b=-0.7,c=-0.8,d=-0.9,e=-0.1,f=-2.5,g=0,h=1))
+#Make a column vector with the names of the parameters you want to track
+Parameters <- c("a","b","c","d","e","f","g","h")
+#Set the variables for the MCMC
+ni <- 100000  #Number of draws from the posterior
+nt <- 20    #Thinning rate 
+nb <- 50000  #Number to discard for burn-in 
+nc <- 4  #Number of chains
+#Run the JAGS function to run the code
+Results = jags(inits=Initial,
+         n.chains=nc,
+         model.file="MinHomeRange.jags",
+         working.directory=getwd(),
+         data=TrainingSetModel,
+         parameters.to.save=Parameters,
+         n.thin=nt,
+         n.iter=ni,
+         n.burnin=nb,
+         DIC=T)
+#Print the results
+Results
+```
+
+#Check for model convergence
+
+```{r}
+#Plot the four MCMC chains
+MCMCConvergence <- as.mcmc(Results)
+plot(MCMCConvergence[,1]) #For a
+plot(MCMCConvergence[,2]) #For b
+plot(MCMCConvergence[,3]) #For c
+plot(MCMCConvergence[,4]) #For d
+plot(MCMCConvergence[,6]) #For e
+plot(MCMCConvergence[,7]) #For f
+plot(MCMCConvergence[,8]) #For g
+plot(MCMCConvergence[,9]) #For h
+```
+
+#Test model
+
+```{r}
+#Store values at training presence and absence points.  This is for my model of minimum home range size (buffer = 600 m).
+Bio3 <- c(length=98)
+for(i in 1:98){
+  Bio3[i] <- raster::extract(Bio3Standardized,TestingDF[i,1:2],buffer=600,fun=mean,sp=TRUE)
+  TestingDF[i,4] <- Bio3[i]
+  TestingDF <- as.data.frame(TestingDF)
+}
+Bio5 <- c(length=98)
+for(i in 1:98){
+  Bio5[i] <- raster::extract(Bio5Standardized,TestingDF[i,1:2],buffer=600,fun=mean,sp=TRUE)
+  TestingDF[i,5] <- Bio5[i]
+  TestingDF <- as.data.frame(TestingDF)
+}
+Bio16 <- c(length=98)
+for(i in 1:98){
+  Bio16[i] <- raster::extract(Bio16Standardized,TestingDF[i,1:2],buffer=600,fun=mean,sp=TRUE)
+  TestingDF[i,6] <- Bio16[i]
+  TestingDF <- as.data.frame(TestingDF)
+}
+Bio17 <- c(length=98)
+for(i in 1:98){
+  Bio17[i] <- raster::extract(Bio17Standardized,TestingDF[i,1:2],buffer=600,fun=mean,sp=TRUE)
+  TestingDF[i,7] <- Bio17[i]
+  TestigDF <- as.data.frame(TestingDF)
+}
+Density <- c(length=98)
+for(i in 1:98){
+  Density[i] <- raster::extract(DensityStandardized,TestingDF[i,1:2],buffer=600,fun=mean,sp=TRUE)
+  TestingDF[i,8] <- Density[i]
+  TestingDF <- as.data.frame(TestingDF)
+}
+Pop <- c(length=98)
+for(i in 1:98){
+  Pop[i] <- raster::extract(PopStandardized,TestingDF[i,1:2],buffer=600,fun=mean,sp=TRUE)
+  TestingDF[i,9] <- Pop[i]
+  TestingDF <- as.data.frame(TestingDF)
+}
+Roads <- c(length=98)
+for(i in 1:98){
+  Roads[i] <- raster::extract(RoadsStandardized,TestingDF[i,1:2],buffer=600,fun=mean,sp=TRUE)
+  TestingDF[i,10] <- Roads[i]
+  TestingDF <- as.data.frame(TestingDF)
+}
+```
+
+```{r}
+#Probability of occurrence at training sites
+POcc <- c(length=195)
+for(i in 1:195){
+  POcc[i] <- inv.logit(-2.248-0.014*TrainingDF[i,4]-0.244*TrainingDF[i,5]+0.179*TrainingDF[i,6]+0.031*TrainingDF[i,7]+2.204*TrainingDF[i,8]-1.271*TrainingDF[i,9]-2.806*TrainingDF[i,10]) #The numbers are the mean values of a, b, c, d, e, f, g, h on which the model converged
+  TrainingDF[i,11] <- POcc[i]
+}
+```
+
+```{r}
+#Probability of occurrence at testing sites
+POcc <- c(length=98)
+for(i in 1:98){
+  POcc[i] <- inv.logit(-2.248-0.014*TestingDF[i,4]-0.244*TestingDF[i,5]+0.179*TestingDF[i,6]+0.031*TestingDF[i,7]+2.204*TestingDF[i,8]-1.271*TestingDF[i,9]-2.806*TestingDF[i,10]) #The numbers are the mean values of a, b, c, d, e, f, g, h on which the model converged
+  TestingDF[i,11] <- POcc[i]
+}
+```
+
+```{r}
+#Turn probability of occurrenc into presence/absence
+Prediction <- c(length=98)
+for(i in 1:98){
+  if(TestingDF[i,11]>0.343){ #This threshold is what would allow 90% of my training presences to correctly be identified as presences
+    Prediction[i] <- 1
+  }else{
+    Prediction[i] <- 0
+  }
+}
+TestingDF <- cbind(TestingDF,Prediction)
+TestingDF <- as.data.frame(TestingDF)
+```
+
+```{r}
+#Calculate AUC
+#Store the observed presence/absence of the testing data
+Category <- TestingDF[,3]
+#Store predicted presence/absence of the testing data
+Prediction <- TestingDF[,12]
+Roc <- roc(Category,Prediction) #Determine the receiver operating curve
+auc(Roc) #Find the area under the receiver operating curve
+```
+
+#Visualize model
+
+Note: All raster layers must have the same extent and resolution in order for this section of the code to work.
+
+```{r}
+#Store the rasters of the environmental layers as dataframes
+Bio3StandardizedData <- rasterToPoints(Bio3Standardized)
+Bio3StandardizedData <- as.data.frame(Bio3StandardizedData)
+Bio5StandardizedData <- rasterToPoints(Bio5Standardized)
+Bio5StandardizedData <- as.data.frame(Bio5StandardizedData)
+Bio16StandardizedData <- rasterToPoints(Bio16Standardized)
+Bio16StandardizedData <- as.data.frame(Bio16StandardizedData)
+Bio17StandardizedData <- rasterToPoints(Bio17Standardized)
+Bio17StandardizedData <- as.data.frame(Bio17StandardizedData)
+DensityStandardizedData <- rasterToPoints(DensityStandardized)
+DensityStandardizedData <- as.data.frame(DensityStandardizedData)
+PopStandardizedData <- rasterToPoints(PopStandardized)
+PopStandardizedData <- as.data.frame(PopStandardizedData)
+RoadsStandardizedData <- rasterToPoints(RoadsStandardized)
+RoadsStandardizedData <- as.data.frame(RoadsStandardizedData)
+```
+
+```{r}
+#In every grid cell, you plug the values of the different environmental into your model to determine the probability of occurrence at that spot. The numbers are the mean values of a, b, c, d, e, f, g, h on which the model converged.
+WoollyMonkeyMap <- overlay(Bio3Standardized,Bio5Standardized,Bio16Standardized,Bio17Standardized,DensityStandardized,PopStandardized,RoadsStandardized,fun=function(Bio3StandardizedData,Bio5StandardizedData,Bio16StandardizedData,Bio17StandardizedData,DensityStandardizedData,PopStandardizedData,RoadsStandardizedData){inv.logit(-2.248-0.014*Bio3StandardizedData-0.244*Bio5StandardizedData+0.179*Bio16StandardizedData+0.031*Bio17StandardizedData+2.204*DensityStandardizedData-1.271*PopStandardizedData-2.806*RoadsStandardizedData)})
+#Save as dataframe for ggplot
+WoollyMonkeyMapData <- rasterToPoints(WoollyMonkeyMap)
+WoollyMonkeyMapData <- as.data.frame(WoollyMonkeyMapData)
+```
+
+```{r}
+#Plot the predicted probability of occurrence across the study region and the presence data
+ggplot(data=WoollyMonkeyMapData,aes(x=x,y=y))+geom_raster(aes(fill=layer))+coord_quickmap()+geom_point(data=ThinnedWoollyMonkeyPresences,aes(x=longitude,y=latitude),color="#F0E442")+theme_classic()
+```
+
+
+
+
+
+
+
+
+
